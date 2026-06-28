@@ -363,8 +363,14 @@ def _worker() -> None:
 
 # ── startup ─────────────────────────────────────────────────────────────────────
 
+_startup_done = False
+
 @app.on_event("startup")
 async def _startup():
+    global _startup_done
+    if _startup_done:
+        return
+    _startup_done = True
     log.info("MisoTTS server starting up")
     _load_queue_from_disk()
     threading.Thread(target=_worker, daemon=True).start()
