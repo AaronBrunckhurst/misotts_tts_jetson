@@ -2,12 +2,15 @@ import gc
 import glob
 import io
 import json
+import logging
 import os
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Optional
 
 import psutil
@@ -45,6 +48,29 @@ sys.path.insert(0, MISOTTS_DIR)
 os.makedirs(VOICES_DIR,  exist_ok=True)
 os.makedirs(OUTPUTS_DIR, exist_ok=True)
 
+# ── logging ────────────────────────────────────────────────────────────────────
+
+LOG_FILE     = os.path.join(MISOTTS_DIR, "tts_server.log")
+LOG_FMT      = "%(asctime)s %(levelname)s %(message)s"
+LOG_DATE_FMT = "%Y-%m-%dT%H:%M:%S"
+_LOG_RE      = __import__("re").compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (.*)$"
+)
+
+log = logging.getLogger("misotts")
+log.setLevel(logging.DEBUG)
+
+# stdout → journalctl
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATE_FMT))
+log.addHandler(_sh)
+
+# rotating file — 5 MB × 5 = 25 MB max
+from logging.handlers import RotatingFileHandler as _RFH
+_fh = _RFH(LOG_FILE, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+_fh.setFormatter(logging.Formatter(LOG_FMT, datefmt=LOG_DATE_FMT))
+log.addHandler(_fh)
+
 # ── state ──────────────────────────────────────────────────────────────────────
 
 _mstate: dict = {
@@ -78,11 +104,14 @@ def _load_queue_from_disk() -> None:
         return
     with open(QUEUE_FILE) as f:
         data = json.load(f)
+    reset = 0
     for job in data:
         if job.get("status") == "processing":
             job["status"]     = "pending"
             job["started_at"] = None
+            reset += 1
     _queue = data
+    log.info(f"Loaded {len(data)} job(s) from disk ({reset} reset from processing→pending)")
 
 # ── idle timer ─────────────────────────────────────────────────────────────────
 
@@ -95,6 +124,7 @@ def _start_idle_timer() -> None:
         _idle_timer = threading.Timer(IDLE_TIMEOUT, _auto_unload)
         _idle_timer.daemon = True
         _idle_timer.start()
+        log.info(f"Idle timer started — auto-unload in {IDLE_TIMEOUT//60} min")
 
 
 def _cancel_idle_timer() -> None:
@@ -107,6 +137,7 @@ def _cancel_idle_timer() -> None:
 
 
 def _auto_unload() -> None:
+    log.info("Idle timeout reached — auto-unloading model")
     _cancel_idle_timer()
     _unload()
 
@@ -114,6 +145,8 @@ def _auto_unload() -> None:
 
 def _load_blocking() -> None:
     _mstate.update(status="loading", error=None, progress=0, progress_msg="Starting…")
+    t0 = time.time()
+    log.info("Model load started")
     try:
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
@@ -122,9 +155,11 @@ def _load_blocking() -> None:
         already_cached = cached is not None and os.path.exists(str(cached))
 
         if not already_cached:
+            log.info("Model not in cache — downloading from HuggingFace (~16 GB)")
             _mstate["progress_msg"] = "Downloading model weights (~16 GB)…"
             dl_error: list = [None]
             dl_done = threading.Event()
+            _last_dl_pct: list = [-1]
 
             def _do_dl():
                 try:
@@ -148,19 +183,27 @@ def _load_blocking() -> None:
                             if os.path.isfile(f)
                         )
                         if total > 0:
-                            _mstate["progress"] = min(49, int(50 * total / EXPECTED_MODEL_BYTES))
+                            pct = min(49, int(50 * total / EXPECTED_MODEL_BYTES))
+                            _mstate["progress"] = pct
                             _mstate["progress_msg"] = (
                                 f"Downloading: {total/1_048_576:,.0f} / ~16,100 MB"
                             )
+                            milestone = (pct // 10) * 10
+                            if milestone > _last_dl_pct[0]:
+                                _last_dl_pct[0] = milestone
+                                log.info(f"Download {milestone}% ({total/1_048_576:,.0f} MB)")
                 except Exception:
                     pass
                 dl_done.wait(timeout=0.5)
             if dl_error[0]:
                 raise dl_error[0]
+            log.info(f"Download complete ({(time.time()-t0)/60:.1f} min)")
         else:
+            log.info("Model found in HuggingFace cache — skipping download")
             _mstate.update(progress=50, progress_msg="Found in cache, loading into memory…")
 
         # Phase 2 — memory load (50 → 100%)
+        log.info("Loading model into memory (~16 GB)")
         _mstate.update(progress=50, progress_msg="Loading model into memory (~16 GB)…")
         start_ram = psutil.virtual_memory().used
         load_done = threading.Event()
@@ -182,9 +225,12 @@ def _load_blocking() -> None:
         from generator import load_miso_8b
         _mstate["generator"] = load_miso_8b(device="cpu")
         load_done.set()
+        elapsed = time.time() - t0
+        log.info(f"Model ready — total load time {elapsed/60:.1f} min")
         _mstate.update(status="ready", progress=100, progress_msg="Ready")
 
     except Exception as exc:
+        log.error(f"Model load failed: {exc}")
         _mstate.update(status="unloaded", error=str(exc), progress=0, progress_msg="")
 
 
@@ -194,6 +240,7 @@ def _unload() -> None:
     _mstate.update(status="unloaded", error=None, progress=0, progress_msg="", idle_until=None)
     gc.collect()
     torch.cuda.empty_cache()
+    log.info("Model unloaded, memory freed")
 
 # ── job processing ──────────────────────────────────────────────────────────────
 
@@ -206,6 +253,13 @@ def _process_job(job: dict) -> None:
     _mstate["status"] = "busy"
     with _queue_lock:
         _save_queue()
+
+    label = job.get("label") or job["id"]
+    log.info(
+        f"Job {job['id']} started — label={label!r} speaker={job.get('speaker',0)} "
+        f"voice={job.get('voice_name') or 'none'} tone={job.get('tone_preset') or 'none'} "
+        f"text_len={len(job['text'])} chars"
+    )
 
     try:
         gen     = _mstate["generator"]
@@ -220,6 +274,7 @@ def _process_job(job: dict) -> None:
         full_preamble = " ".join(parts).strip()
 
         if full_preamble:
+            log.debug(f"Job {job['id']} preamble context: {full_preamble[:80]!r}")
             # 0.5 s of silence as placeholder audio — primes tone from text
             context.append(Segment(
                 speaker=job.get("speaker", 0),
@@ -232,6 +287,7 @@ def _process_job(job: dict) -> None:
             wav_p = os.path.join(VOICES_DIR, f"{job['voice_name']}.wav")
             txt_p = os.path.join(VOICES_DIR, f"{job['voice_name']}.txt")
             if os.path.exists(wav_p):
+                log.debug(f"Job {job['id']} loading voice clone: {job['voice_name']}")
                 wf, sr = torchaudio.load(wav_p)
                 if sr != gen.sample_rate:
                     wf = torchaudio.functional.resample(wf, sr, gen.sample_rate)
@@ -241,7 +297,10 @@ def _process_job(job: dict) -> None:
                     text=transcript,
                     audio=wf[0],
                 ))
+            else:
+                log.warning(f"Job {job['id']} voice {job['voice_name']!r} WAV not found — skipping")
 
+        log.info(f"Job {job['id']} synthesis starting ({len(context)} context segment(s))")
         audio = gen.generate(
             text=job["text"],
             speaker=job.get("speaker", 0),
@@ -251,16 +310,20 @@ def _process_job(job: dict) -> None:
 
         out_path = os.path.join(OUTPUTS_DIR, f"{job['id']}.wav")
         torchaudio.save(out_path, audio.unsqueeze(0).cpu(), gen.sample_rate, format="wav")
+        out_size_kb = round(os.path.getsize(out_path) / 1024)
 
+        duration = round(time.time() - job["started_at"], 1)
         job.update(
             status="completed",
             completed_at=time.time(),
-            duration_sec=round(time.time() - job["started_at"], 1),
+            duration_sec=duration,
             output_file=f"{job['id']}.wav",
         )
+        log.info(f"Job {job['id']} completed in {duration}s — output {out_size_kb} KB")
 
     except Exception as exc:
         job.update(status="failed", completed_at=time.time(), error=str(exc))
+        log.error(f"Job {job['id']} failed: {exc}")
 
     finally:
         _mstate["status"] = "ready"
@@ -270,6 +333,7 @@ def _process_job(job: dict) -> None:
 # ── worker thread ───────────────────────────────────────────────────────────────
 
 def _worker() -> None:
+    log.info("Worker thread started")
     while True:
         _new_job_event.wait(timeout=5)
         _new_job_event.clear()
@@ -282,6 +346,7 @@ def _worker() -> None:
                 _start_idle_timer()
             continue
 
+        log.info(f"Worker found {len(pending)} pending job(s)")
         _cancel_idle_timer()
 
         if _mstate["status"] == "unloaded":
@@ -300,6 +365,7 @@ def _worker() -> None:
 
 @app.on_event("startup")
 async def _startup():
+    log.info("MisoTTS server starting up")
     _load_queue_from_disk()
     threading.Thread(target=_worker, daemon=True).start()
     _new_job_event.set()
@@ -362,6 +428,7 @@ async def enqueue(req: EnqueueReq):
         _save_queue()
     _cancel_idle_timer()
     _new_job_event.set()
+    log.info(f"Job {job['id']} enqueued — label={req.label!r} text={req.text[:60]!r}")
     return job
 
 
@@ -379,6 +446,7 @@ async def delete_job(job_id: str):
                 os.remove(p)
         _queue.remove(job)
         _save_queue()
+    log.info(f"Job {job_id} cancelled")
     return {"deleted": job_id}
 
 
@@ -432,7 +500,9 @@ async def add_voice(
     torchaudio.save(os.path.join(VOICES_DIR, f"{safe}.wav"), wf, 24_000)
     with open(os.path.join(VOICES_DIR, f"{safe}.txt"), "w") as f:
         f.write(transcript.strip())
-    return {"name": safe, "duration_sec": round(wf.shape[1] / 24_000, 1)}
+    dur = round(wf.shape[1] / 24_000, 1)
+    log.info(f"Voice {safe!r} added ({dur}s)")
+    return {"name": safe, "duration_sec": dur}
 
 
 @app.delete("/voices/{name}")
@@ -443,7 +513,39 @@ async def delete_voice(name: str):
     for p in [wp, os.path.join(VOICES_DIR, f"{name}.txt")]:
         if os.path.exists(p):
             os.remove(p)
+    log.info(f"Voice {name!r} deleted")
     return {"deleted": name}
+
+
+@app.get("/logs")
+async def get_logs(lines: int = 500):
+    """Return recent log lines parsed from the log file."""
+    entries = []
+    try:
+        # Collect lines from the active log file (newest lines = tail)
+        with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.readlines()
+        for line in raw[-lines:]:
+            m = _LOG_RE.match(line.rstrip())
+            if m:
+                ts_str, level, msg = m.group(1), m.group(2), m.group(3)
+                entries.append({"ts": ts_str, "level": level, "msg": msg})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log.warning(f"Could not read log file: {exc}")
+    return {"entries": entries, "log_file": LOG_FILE}
+
+
+@app.delete("/logs")
+async def clear_logs():
+    """Truncate the log file (keeps it in place so the handler still works)."""
+    try:
+        open(LOG_FILE, "w").close()
+        log.info("Log file cleared via HTTP")
+    except Exception as exc:
+        raise HTTPException(500, f"Could not clear log: {exc}")
+    return {"cleared": True}
 
 
 # ── HTML ────────────────────────────────────────────────────────────────────────
@@ -607,7 +709,7 @@ hr{border:none;border-top:1px solid #1e2535;margin:.75rem 0}
 </div>
 
 <!-- Voices -->
-<div class="card">
+<div class="card" id="voices-card">
   <div class="card-title section-toggle" id="voices-toggle" onclick="toggleVoices()">Voices</div>
   <div id="voices-section">
     <div class="voices-list" id="voices-list"><p style="color:#4a5568;font-size:.82rem">No saved voices.</p></div>
@@ -628,12 +730,26 @@ hr{border:none;border-top:1px solid #1e2535;margin:.75rem 0}
   </div>
 </div>
 
+<!-- Logs -->
+<div class="card">
+  <div class="card-title section-toggle" id="logs-toggle" onclick="toggleLogs()">Logs</div>
+  <div id="logs-section">
+    <div id="log-panel" style="background:#060810;font-family:monospace;font-size:.74rem;height:280px;overflow-y:auto;border-radius:6px;padding:.6rem .8rem;display:flex;flex-direction:column;gap:.1rem;line-height:1.5"></div>
+    <div style="margin-top:.5rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+      <button class="btn-gray" onclick="clearLogs()">Clear log</button>
+      <span id="log-meta" style="font-size:.72rem;color:#4a5568"></span>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── state ─────────────────────────────────────────────────────────────────────
 let pollTimer = null;
 let _enqueueing = false;
 let queuePollTimer = null;
+let logPollTimer = null;
 let voicesCollapsed = false;
+let logsCollapsed = false;
 const openAudioIds = new Set();  // job IDs with expanded audio player
 
 // ── polling ───────────────────────────────────────────────────────────────────
@@ -641,9 +757,10 @@ function startPolling() {
   stopPolling();
   pollTimer      = setInterval(pollStatus, 2000);
   queuePollTimer = setInterval(loadQueue,  2500);
+  logPollTimer   = setInterval(loadLogs,   3000);
 }
 function stopPolling() {
-  clearInterval(pollTimer); clearInterval(queuePollTimer);
+  clearInterval(pollTimer); clearInterval(queuePollTimer); clearInterval(logPollTimer);
 }
 
 async function pollStatus() {
@@ -874,6 +991,49 @@ async function deleteVoice(name) {
   } catch(e) { alert(e.message); }
 }
 
+// ── logs ──────────────────────────────────────────────────────────────────────
+const LOG_COLORS = {DEBUG:'#4a5568', INFO:'#cbd5e0', WARNING:'#ecc94b', ERROR:'#fc8181', CRITICAL:'#f56565'};
+
+async function loadLogs() {
+  if (logsCollapsed) return;
+  try {
+    const d = await (await fetch('/logs')).json();
+    renderLogs(d.entries, d.log_file);
+  } catch(e) {}
+}
+
+function renderLogs(entries, logFile) {
+  const panel = document.getElementById('log-panel');
+  const atBottom = panel.scrollHeight - panel.scrollTop <= panel.clientHeight + 8;
+  panel.innerHTML = entries.length === 0
+    ? '<span style="color:#4a5568">No log entries yet.</span>'
+    : entries.map(e => {
+        const color = LOG_COLORS[e.level] || '#cbd5e0';
+        const ts = e.ts.replace('T', ' ');
+        return `<div><span style="color:#4a5568">${esc(ts)}</span> `
+             + `<span style="color:${color};font-weight:700">${e.level}</span> `
+             + `<span style="color:${color}">${esc(e.msg)}</span></div>`;
+      }).join('');
+  if (atBottom) panel.scrollTop = panel.scrollHeight;
+  const meta = document.getElementById('log-meta');
+  meta.textContent = entries.length + ' entries' + (logFile ? ' · ' + logFile : '');
+}
+
+async function clearLogs() {
+  if (!confirm('Clear the log file?')) return;
+  try {
+    await fetch('/logs', {method:'DELETE'});
+    await loadLogs();
+  } catch(e) { alert('Could not clear logs: ' + e.message); }
+}
+
+function toggleLogs() {
+  logsCollapsed = !logsCollapsed;
+  document.getElementById('logs-section').style.display = logsCollapsed ? 'none' : 'block';
+  document.getElementById('logs-toggle').classList.toggle('collapsed', logsCollapsed);
+  if (!logsCollapsed) loadLogs();
+}
+
 // ── utils ─────────────────────────────────────────────────────────────────────
 function esc(s) {
   return String(s)
@@ -885,6 +1045,7 @@ function esc(s) {
 pollStatus();
 loadQueue();
 loadVoices();
+loadLogs();
 startPolling();
 </script>
 </body>
