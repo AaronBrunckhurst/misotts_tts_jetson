@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+outputs/
+voices/
+queue.json
+*.wav
+*.mp3
+*.safetensors
+*.bin
+.env

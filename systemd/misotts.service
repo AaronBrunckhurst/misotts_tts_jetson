@@ -1,0 +1,18 @@
+[Unit]
+Description=MisoTTS HTTP Control Panel
+After=network.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__REPO_DIR__
+Environment="LD_PRELOAD=__LIBGOMP__"
+Environment="PATH=__PYENV_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=__VENV__/bin/python tts_server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
