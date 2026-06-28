@@ -1,0 +1,3 @@
+* text=auto
+scripts/*.sh text eol=lf
+systemd/misotts.service text eol=lf
