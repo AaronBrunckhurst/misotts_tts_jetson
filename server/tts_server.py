@@ -59,6 +59,7 @@ _LOG_RE      = __import__("re").compile(
 
 log = logging.getLogger("misotts")
 log.setLevel(logging.DEBUG)
+log.propagate = False  # prevent messages reaching uvicorn's root handler (avoids duplicates)
 
 # stdout → journalctl
 _sh = logging.StreamHandler(sys.stdout)
@@ -223,6 +224,30 @@ def _load_blocking() -> None:
 
         threading.Thread(target=_monitor_ram, daemon=True).start()
         from generator import load_miso_8b
+        import generator as _gen_mod
+        import safetensors.torch as _sft_torch
+
+        # generator._load_model uses load_file() which creates a full 16 GB state_dict
+        # copy before loading it into the model — peak = 32 GB, OOM on 30 GB Jetson.
+        # Replace it with safetensors.load_model() which loads directly into the model.
+        def _low_mem_load_model(model_path_or_repo_id, config, device, dtype):
+            import os
+            from models import Model
+            from huggingface_hub import hf_hub_download
+            if os.path.isfile(model_path_or_repo_id):
+                model_file = model_path_or_repo_id
+            elif os.path.isdir(model_path_or_repo_id):
+                model_file = os.path.join(model_path_or_repo_id, "model.safetensors")
+            else:
+                model_file = hf_hub_download(repo_id=model_path_or_repo_id, filename="model.safetensors")
+            model = Model(config)
+            _sft_torch.load_model(model, model_file)
+            model.to(device=device, dtype=dtype)
+            model.eval()
+            return model
+
+        _gen_mod._load_model = _low_mem_load_model
+        log.info("Using low-memory model loader (direct safetensors → model, no intermediate copy)")
         _mstate["generator"] = load_miso_8b(device="cpu")
         load_done.set()
         elapsed = time.time() - t0
@@ -350,7 +375,9 @@ def _worker() -> None:
         _cancel_idle_timer()
 
         if _mstate["status"] == "unloaded":
-            _load_blocking()
+            with _idle_timer_lock:   # reuse existing lock as a load mutex
+                if _mstate["status"] == "unloaded":
+                    _load_blocking()
 
         if _mstate["status"] != "ready":
             continue
@@ -363,14 +390,16 @@ def _worker() -> None:
 
 # ── startup ─────────────────────────────────────────────────────────────────────
 
+_startup_lock = threading.Lock()
 _startup_done = False
 
 @app.on_event("startup")
 async def _startup():
     global _startup_done
-    if _startup_done:
-        return
-    _startup_done = True
+    with _startup_lock:
+        if _startup_done:
+            return
+        _startup_done = True
     log.info("MisoTTS server starting up")
     _load_queue_from_disk()
     threading.Thread(target=_worker, daemon=True).start()
