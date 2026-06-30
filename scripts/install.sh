@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install.sh — Idempotent MisoTTS setup for Jetson AGX Orin (JetPack 5 / Ubuntu 20.04 focal / aarch64)
-# Run as the target user (pineway). Prompts for sudo once at the start.
+# Run as the target user. Prompts for sudo once at the start.
 set -euo pipefail
 
 REPO_DIR="$HOME/misotts"

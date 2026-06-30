@@ -69,7 +69,7 @@ MisoTTS requires Python 3.10. NVIDIA's official PyTorch wheels for JetPack 5 (CU
 ## Prerequisites
 
 - A Jetson AGX Orin with JetPack 5.x flashed and booted
-- The Jetson is on your local network and reachable by hostname (e.g., `pineway-desktop`)
+- The Jetson is on your local network and reachable by hostname (e.g., `my-jetson`)
 - SSH access from your laptop (key-based preferred)
 - ~20 GB free disk space (16 GB model + venv + outputs)
 - Internet access from the Jetson (for downloading packages and model weights)
@@ -88,8 +88,8 @@ cd ~/misotts-jetson
 Copy the project to the Jetson and run the installer:
 
 ```bash
-scp -r . pineway@pineway-desktop:~/misotts-jetson
-ssh pineway@pineway-desktop "bash ~/misotts-jetson/scripts/install.sh"
+scp -r . <user>@<your-jetson>:~/misotts-jetson
+ssh <user>@<your-jetson> "bash ~/misotts-jetson/scripts/install.sh"
 ```
 
 The installer is fully idempotent — safe to re-run after partial failures. It will:
@@ -110,7 +110,7 @@ The model weights (~16 GB) are **not** downloaded at install time. They download
 
 ## Usage
 
-Open `http://pineway-desktop:8080` in your browser.
+Open `http://<your-jetson>:8080` in your browser.
 
 ### Work Order Queue
 
@@ -264,7 +264,7 @@ TONE_PRESETS = {
     "Dramatic":       "This is an emotionally charged, dramatic and expressive reading.",
 }
 
-MISOTTS_DIR  = "/home/pineway/misotts"
+MISOTTS_DIR  = os.path.expanduser("~/misotts")
 VOICES_DIR   = os.path.join(MISOTTS_DIR, "voices")
 OUTPUTS_DIR  = os.path.join(MISOTTS_DIR, "outputs")
 QUEUE_FILE   = os.path.join(MISOTTS_DIR, "queue.json")
@@ -349,7 +349,7 @@ This is expected on JetPack 5. The model runs on CPU. See [The CPU-Only Constrai
 ## File Layout on the Jetson
 
 ```
-/home/pineway/
+~/
 ├── .pyenv/versions/3.10.14/    Python 3.10 compiled from source
 └── misotts/                    MisoTTS repo
     ├── .venv/                  Python venv

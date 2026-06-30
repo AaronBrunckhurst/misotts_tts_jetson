@@ -21,7 +21,7 @@ from pydantic import BaseModel
 
 # ── config ─────────────────────────────────────────────────────────────────────
 
-MISOTTS_DIR  = "/home/pineway/misotts"
+MISOTTS_DIR  = os.path.expanduser("~/misotts")
 VOICES_DIR   = os.path.join(MISOTTS_DIR, "voices")
 OUTPUTS_DIR  = os.path.join(MISOTTS_DIR, "outputs")
 QUEUE_FILE   = os.path.join(MISOTTS_DIR, "queue.json")
